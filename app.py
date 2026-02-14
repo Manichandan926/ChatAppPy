@@ -1,19 +1,14 @@
 from flask import Flask, request, jsonify
-import json
-import random
 from datetime import datetime
 from collections import defaultdict
-import uuid
+import time
 
 app = Flask(__name__)
 
-BOT_HISTORY = []
-USER_ROLE = {}
-USER_NAMES = {}
-USER_SESSIONS = {}  # Track active sessions
-MESSAGE_METADATA = {}  # Store timestamps, read status
-TYPING_INDICATORS = {}  # Who's typing
-ROOM_CHANNELS = defaultdict(list)  # Multiple chat rooms
+# --- In-Memory Storage ---
+BOT_HISTORY = []  # List of dicts: {'id': int, 'sender': str, 'role': str, 'text': str, 'time': str, 'type': str}
+USER_SESSIONS = {}  # browser_id -> {'name': str, 'role': str, 'last_seen': float}
+TYPING_STATUS = {}  # browser_id -> timestamp
 
 @app.route("/")
 def home():
@@ -21,16 +16,13 @@ def home():
 
 @app.route("/messages")
 def get_messages():
-    result = []
-    for idx, msg in enumerate(BOT_HISTORY):
-        meta = MESSAGE_METADATA.get(idx, {})
-        result.append({
-            "id": idx,
-            "content": msg,
-            "timestamp": meta.get("timestamp"),
-            "read_by": meta.get("read_by", [])
-        })
-    return jsonify(result)
+    # client sends the ID of the last message they already have
+    last_id = int(request.args.get('last_id', -1))
+    
+    # Return only messages newer than last_id
+    new_messages = [msg for msg in BOT_HISTORY if msg['id'] > last_id]
+    
+    return jsonify(new_messages)
 
 @app.route("/send", methods=["POST"])
 def send_message():
@@ -42,60 +34,85 @@ def send_message():
     if not message:
         return jsonify(status="empty")
 
+    # Update session activity
+    if browser_id in USER_SESSIONS:
+        USER_SESSIONS[browser_id]['last_seen'] = time.time()
+
+    # --- Registration Logic ---
     if message.lower().startswith("register "):
         parts = message.lower().split(" ", 1)
         if len(parts) == 2:
             role = parts[1].upper()
             if role in ["A", "B"]:
-                USER_ROLE[browser_id] = role
-                USER_NAMES[browser_id] = username or f"User {role}"
-                USER_SESSIONS[browser_id] = {"joined_at": datetime.now().isoformat()}
+                USER_SESSIONS[browser_id] = {
+                    'name': username or f"User {role}", 
+                    'role': role,
+                    'last_seen': time.time()
+                }
                 
-                BOT_HISTORY.append(f"👤 {USER_NAMES[browser_id]} ({role}) joined")
-                MESSAGE_METADATA[len(BOT_HISTORY)-1] = {"timestamp": datetime.now().isoformat(), "read_by": []}
+                new_msg = {
+                    'id': len(BOT_HISTORY),
+                    'sender': "System",
+                    'role': 'SYSTEM',
+                    'text': f"👤 {USER_SESSIONS[browser_id]['name']} joined as {role}",
+                    'time': datetime.now().isoformat(),
+                    'type': 'system'
+                }
+                BOT_HISTORY.append(new_msg)
                 return jsonify(status="ok")
 
-    if browser_id in USER_ROLE:
-        role = USER_ROLE[browser_id]
-        name = USER_NAMES.get(browser_id, f"User {role}")
-        msg_text = f"[{role}] {name}: {message}"
-        BOT_HISTORY.append(msg_text)
-        
-        msg_id = len(BOT_HISTORY) - 1
-        MESSAGE_METADATA[msg_id] = {
-            "timestamp": datetime.now().isoformat(),
-            "sender_id": browser_id,
-            "read_by": [browser_id]
+    # --- Chat Logic ---
+    if browser_id in USER_SESSIONS:
+        user = USER_SESSIONS[browser_id]
+        new_msg = {
+            'id': len(BOT_HISTORY),
+            'sender': user['name'],
+            'role': user['role'],
+            'text': message,
+            'time': datetime.now().isoformat(),
+            'type': 'chat'
         }
-        
-        return jsonify(status="ok", message_id=msg_id)
+        BOT_HISTORY.append(new_msg)
+        return jsonify(status="ok")
     else:
         return jsonify(status="error", message="Please register first")
 
 @app.route("/typing", methods=["POST"])
-def typing_status():
+def typing_endpoint():
     data = request.json
     browser_id = data.get("browser_id")
     is_typing = data.get("is_typing", False)
     
     if is_typing:
-        TYPING_INDICATORS[browser_id] = USER_NAMES.get(browser_id, "User")
+        TYPING_STATUS[browser_id] = time.time()
     else:
-        TYPING_INDICATORS.pop(browser_id, None)
+        TYPING_STATUS.pop(browser_id, None)
     
-    return jsonify(typing=list(TYPING_INDICATORS.values()))
+    # Clean up old typing statuses (> 3 seconds)
+    current_time = time.time()
+    active_typing = []
+    
+    for bid, timestamp in list(TYPING_STATUS.items()):
+        if current_time - timestamp > 3:
+            del TYPING_STATUS[bid]
+        else:
+            name = USER_SESSIONS.get(bid, {}).get('name', 'Unknown')
+            active_typing.append(name)
+            
+    return jsonify(typing_names=active_typing)
 
 @app.route("/online-users")
 def get_online_users():
-    users = []
-    for bid, role in USER_ROLE.items():
-        users.append({
-            "browser_id": bid,
-            "name": USER_NAMES.get(bid),
-            "role": role,
-            "joined_at": USER_SESSIONS.get(bid, {}).get("joined_at")
-        })
-    return jsonify(users)
+    # Remove users inactive for > 60 seconds
+    current_time = time.time()
+    active_users = []
+    
+    for bid, data in list(USER_SESSIONS.items()):
+        if current_time - data['last_seen'] < 60:
+            active_users.append(data)
+        # We don't delete them from session, just don't show as 'online'
+            
+    return jsonify(active_users)
 
 @app.route("/whatsapp")
 def whatsapp_ui():
@@ -105,171 +122,443 @@ def whatsapp_ui():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Advanced Chat UI</title>
+<title>Pro Chat</title>
 <style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
+/* --- MODERN DARK THEME CSS --- */
 :root {
-    --primary: #0088cc; --primary-dark: #005fa3;
-    --bg-dark: #0d1117; --bg-secondary: #161b22; --bg-tertiary: #21262d;
-    --text-primary: #c9d1d9; --text-secondary: #8b949e;
-    --accent: #58a6ff; --success: #3fb950;
+    --bg-app: #0f172a;
+    --bg-panel: #1e293b;
+    --border: #334155;
+    --primary: #3b82f6;
+    --primary-hover: #2563eb;
+    --text-main: #f1f5f9;
+    --text-muted: #94a3b8;
+    --bubble-sent: #3b82f6;
+    --bubble-received: #334155;
+    --green: #22c55e;
 }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg-dark); color: var(--text-primary); height: 100vh; overflow: hidden; }
-.container { display: flex; height: 100vh; }
-.sidebar { width: 320px; background: var(--bg-secondary); border-right: 1px solid var(--bg-tertiary); display: flex; flex-direction: column; }
-.sidebar-header { padding: 20px; border-bottom: 1px solid var(--bg-tertiary); background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%); }
-.sidebar-header h2 { font-size: 24px; color: white; }
-.user-registration { padding: 16px; border-bottom: 1px solid var(--bg-tertiary); }
-.user-registration input { width: 100%; padding: 10px; margin-bottom: 8px; background: var(--bg-tertiary); border: 1px solid var(--bg-tertiary); border-radius: 6px; color: var(--text-primary); }
-.user-registration button { width: 100%; padding: 10px; background: var(--primary); color: white; border: none; border-radius: 6px; cursor: pointer; transition: 0.2s; margin-top: 4px; }
-.user-registration button:hover { background: var(--primary-dark); }
-.online-users { flex: 1; overflow-y: auto; padding: 12px; }
-.user-item { padding: 12px; margin-bottom: 8px; background: var(--bg-tertiary); border-radius: 8px; border-left: 3px solid var(--success); }
-.user-item-name { font-weight: 500; }
-.user-item-role { font-size: 12px; color: var(--text-secondary); }
-.chat-area { flex: 1; display: flex; flex-direction: column; }
-.chat-header { padding: 16px 24px; border-bottom: 1px solid var(--bg-tertiary); background: var(--bg-secondary); }
-.messages { flex: 1; overflow-y: auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 12px; }
-.message-group { display: flex; animation: fadeInUp 0.3s ease; }
-@keyframes fadeInUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-.message-group.sent { justify-content: flex-end; }
-.message-bubble { max-width: 55%; padding: 10px 14px; border-radius: 12px; font-size: 14px; word-wrap: break-word; }
-.message-group.sent .message-bubble { background: var(--primary); color: white; }
-.message-group.received .message-bubble { background: var(--bg-tertiary); color: var(--text-primary); }
-.message-group.system .message-bubble { background: transparent; color: var(--text-secondary); border: 1px solid var(--bg-tertiary); max-width: 80%; text-align: center; margin: 8px auto; font-size: 12px; }
-.typing-indicator { display: flex; gap: 4px; padding: 10px; }
-.typing-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-secondary); animation: bounce 1.4s infinite; }
-.typing-dot:nth-child(2) { animation-delay: 0.2s; }
-.typing-dot:nth-child(3) { animation-delay: 0.4s; }
-@keyframes bounce { 0%, 80%, 100% { opacity: 0.5; } 40% { opacity: 1; } }
-.input-area { padding: 16px 24px; background: var(--bg-secondary); border-top: 1px solid var(--bg-tertiary); display: flex; gap: 12px; }
-.input-wrapper { flex: 1; display: flex; background: var(--bg-tertiary); border-radius: 20px; padding: 10px 16px; }
-#msg { flex: 1; background: transparent; border: none; color: var(--text-primary); outline: none; }
-.send-btn { width: 40px; height: 40px; border-radius: 50%; background: var(--primary); border: none; color: white; cursor: pointer; }
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background-color: var(--bg-app);
+    color: var(--text-main);
+    height: 100vh;
+    display: flex;
+    overflow: hidden;
+}
+
+/* Sidebar */
+.sidebar {
+    width: 300px;
+    background: var(--bg-panel);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    transition: transform 0.3s ease;
+}
+
+.header {
+    padding: 20px;
+    border-bottom: 1px solid var(--border);
+    font-weight: 600;
+    font-size: 1.1rem;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.user-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 10px;
+}
+
+.user-card {
+    padding: 10px;
+    margin-bottom: 5px;
+    border-radius: 8px;
+    background: rgba(255,255,255,0.03);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    background: var(--green);
+    border-radius: 50%;
+    box-shadow: 0 0 5px var(--green);
+}
+
+/* Main Chat */
+.chat-container {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    background-image: radial-gradient(var(--border) 1px, transparent 1px);
+    background-size: 20px 20px;
+}
+
+.chat-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    scroll-behavior: smooth;
+}
+
+/* Scrollbar Styling */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* Message Bubbles */
+.msg-row {
+    display: flex;
+    width: 100%;
+    opacity: 0;
+    animation: fadeIn 0.3s forwards;
+}
+
+@keyframes fadeIn { to { opacity: 1; transform: translateY(0); } }
+
+.msg-row.sent { justify-content: flex-end; }
+.msg-row.received { justify-content: flex-start; }
+.msg-row.system { justify-content: center; margin: 10px 0; }
+
+.bubble {
+    max-width: 60%;
+    padding: 10px 14px;
+    border-radius: 12px;
+    position: relative;
+    font-size: 0.95rem;
+    line-height: 1.4;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+}
+
+.msg-row.sent .bubble {
+    background: var(--bubble-sent);
+    color: white;
+    border-bottom-right-radius: 2px;
+}
+
+.msg-row.received .bubble {
+    background: var(--bubble-received);
+    color: var(--text-main);
+    border-bottom-left-radius: 2px;
+}
+
+.msg-row.system .bubble {
+    background: rgba(0,0,0,0.3);
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    border-radius: 20px;
+    padding: 4px 12px;
+}
+
+.sender-name {
+    font-size: 0.75rem;
+    font-weight: 700;
+    margin-bottom: 4px;
+    color: rgba(255,255,255,0.7);
+}
+
+.timestamp {
+    font-size: 0.7rem;
+    opacity: 0.7;
+    text-align: right;
+    margin-top: 4px;
+}
+
+/* Typing Indicator */
+.typing-bar {
+    padding: 5px 20px;
+    height: 24px;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+/* Input Area */
+.input-area {
+    padding: 20px;
+    background: var(--bg-panel);
+    display: flex;
+    gap: 10px;
+    border-top: 1px solid var(--border);
+}
+
+input {
+    flex: 1;
+    background: var(--bg-app);
+    border: 1px solid var(--border);
+    padding: 12px;
+    border-radius: 24px;
+    color: white;
+    outline: none;
+    font-size: 1rem;
+}
+
+input:focus { border-color: var(--primary); }
+
+button {
+    background: var(--primary);
+    color: white;
+    border: none;
+    padding: 0 20px;
+    border-radius: 24px;
+    cursor: pointer;
+    font-weight: 600;
+    transition: background 0.2s;
+}
+
+button:hover { background: var(--primary-hover); }
+
+/* Registration Modal */
+.modal-overlay {
+    position: fixed;
+    top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(0,0,0,0.8);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 1000;
+}
+
+.modal {
+    background: var(--bg-panel);
+    padding: 30px;
+    border-radius: 16px;
+    width: 90%;
+    max-width: 400px;
+    border: 1px solid var(--border);
+    text-align: center;
+}
+
+.modal input { width: 100%; margin: 15px 0; }
+.btn-group { display: flex; gap: 10px; justify-content: center; }
+
 </style>
 </head>
 <body>
-<div class="container">
-    <div class="sidebar">
-        <div class="sidebar-header"><h2>💬 Chat</h2></div>
-        <div class="user-registration" id="regForm">
-            <input type="text" id="usernameInput" placeholder="Your name...">
-            <button onclick="registerUser('A')">Join as A</button>
-            <button onclick="registerUser('B')">Join as B</button>
-        </div>
-        <div class="online-users" id="usersList"></div>
-    </div>
-    <div class="chat-area">
-        <div class="chat-header">
-            <h1>General Chat</h1>
-            <p id="userStatus">Not registered</p>
-            <div id="typingStatus" style="font-size:12px; color:var(--text-secondary); margin-top:8px;"></div>
-        </div>
-        <div class="messages" id="chat"></div>
-        <div class="input-area">
-            <div class="input-wrapper">
-                <input type="text" id="msg" placeholder="Type..." onkeydown="handleEnter(event)" oninput="notifyTyping()">
-            </div>
-            <button class="send-btn" onclick="sendMsg()">➤</button>
+
+<div class="modal-overlay" id="loginModal">
+    <div class="modal">
+        <h2>Welcome</h2>
+        <p style="color:var(--text-muted); margin-top:5px;">Enter your name to join</p>
+        <input type="text" id="usernameInput" placeholder="Your Display Name">
+        <div class="btn-group">
+            <button onclick="register('A')">Join as A</button>
+            <button onclick="register('B')" style="background:#475569">Join as B</button>
         </div>
     </div>
 </div>
 
+<div class="sidebar">
+    <div class="header">
+        <span>👥</span> Online Users
+    </div>
+    <div class="user-list" id="userList">
+        </div>
+</div>
+
+<div class="chat-container">
+    <div class="header">
+        <span id="headerTitle">Chat Room</span>
+    </div>
+    
+    <div class="chat-messages" id="chatBox">
+        </div>
+
+    <div class="typing-bar" id="typingBar"></div>
+
+    <div class="input-area">
+        <input type="text" id="msgInput" placeholder="Type a message..." autocomplete="off">
+        <button onclick="sendMessage()">Send</button>
+    </div>
+</div>
+
 <script>
+// --- CONFIGURATION ---
 const browserId = Math.random().toString(36).substring(2);
-let currentUser = null, currentRole = null;
-let typingTimeout = null;
+let lastMessageId = -1;
+let myRole = null;
+let myName = null;
+let typingTimer = null;
 
-async function registerUser(role) {
-    const username = document.getElementById('usernameInput').value.trim() || `User ${role}`;
-    currentUser = username;
-    currentRole = role;
-    document.getElementById('userStatus').textContent = `${username} (${role})`;
-    document.getElementById('regForm').style.display = 'none';
-    await sendMessage(`register ${role}`, username);
-    loadMessages();
-}
+// --- REGISTRATION ---
+async function register(role) {
+    const nameInput = document.getElementById('usernameInput');
+    const name = nameInput.value.trim() || `User ${role}`;
+    
+    myName = name;
+    myRole = role;
 
-async function sendMessage(text, username = currentUser) {
     await fetch('/send', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text, browser_id: browserId, username })
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            message: `register ${role}`,
+            browser_id: browserId,
+            username: name
+        })
     });
+
+    document.getElementById('loginModal').style.display = 'none';
+    document.getElementById('headerTitle').innerText = `${name} (${role})`;
+    document.getElementById('msgInput').focus();
+    
+    startPolling();
 }
 
-function notifyTyping() {
-    clearTimeout(typingTimeout);
-    fetch('/typing', {
+// --- CORE CHAT LOGIC ---
+async function startPolling() {
+    setInterval(fetchMessages, 1000);     // Fetch new messages
+    setInterval(fetchOnlineUsers, 3000); // Fetch online users
+    setInterval(fetchTypingStatus, 1500); // Fetch typing status
+}
+
+async function fetchMessages() {
+    try {
+        // Only ask for messages NEWER than the last one we saw
+        const response = await fetch(`/messages?last_id=${lastMessageId}`);
+        const messages = await response.json();
+
+        if (messages.length === 0) return;
+
+        const chatBox = document.getElementById('chatBox');
+        
+        // Smart scroll detection: are we at the bottom?
+        const isAtBottom = (chatBox.scrollHeight - chatBox.scrollTop) <= (chatBox.clientHeight + 100);
+
+        messages.forEach(msg => {
+            appendMessageToDOM(msg);
+            lastMessageId = msg.id; // Update our tracker
+        });
+
+        if (isAtBottom) {
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+    } catch (e) { console.error("Poll error", e); }
+}
+
+function appendMessageToDOM(msg) {
+    const chatBox = document.getElementById('chatBox');
+    const div = document.createElement('div');
+    
+    // Determine class
+    let rowClass = 'msg-row';
+    if (msg.type === 'system') rowClass += ' system';
+    else if (msg.role === myRole) rowClass += ' sent';
+    else rowClass += ' received';
+    
+    div.className = rowClass;
+
+    const timeStr = new Date(msg.time).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+
+    if (msg.type === 'system') {
+        div.innerHTML = `<div class="bubble">${escapeHtml(msg.text)}</div>`;
+    } else {
+        div.innerHTML = `
+            <div class="bubble">
+                <div class="sender-name">${escapeHtml(msg.sender)}</div>
+                ${escapeHtml(msg.text)}
+                <div class="timestamp">${timeStr}</div>
+            </div>
+        `;
+    }
+
+    chatBox.appendChild(div);
+}
+
+async function sendMessage() {
+    const input = document.getElementById('msgInput');
+    const text = input.value.trim();
+    if (!text) return;
+
+    input.value = '';
+    
+    // Optimistic UI: You could append immediately here, but for now we wait for polling
+    await fetch('/send', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ browser_id: browserId, is_typing: true })
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            message: text,
+            browser_id: browserId,
+            username: myName
+        })
     });
-    typingTimeout = setTimeout(() => {
+    
+    // Trigger immediate fetch
+    fetchMessages();
+}
+
+// --- UTILITIES ---
+function escapeHtml(text) {
+    if (!text) return "";
+    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+}
+
+// --- TYPING & USERS ---
+const msgInput = document.getElementById('msgInput');
+msgInput.addEventListener('input', () => {
+    clearTimeout(typingTimer);
+    fetch('/typing', {
+        method: 'POST', 
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({browser_id: browserId, is_typing: true})
+    });
+    
+    typingTimer = setTimeout(() => {
         fetch('/typing', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ browser_id: browserId, is_typing: false })
+            method: 'POST', 
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({browser_id: browserId, is_typing: false})
         });
     }, 2000);
+});
+
+msgInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+    }
+});
+
+async function fetchOnlineUsers() {
+    const res = await fetch('/online-users');
+    const users = await res.json();
+    const list = document.getElementById('userList');
+    list.innerHTML = users.map(u => `
+        <div class="user-card">
+            <div class="status-dot"></div>
+            <div>
+                <div style="font-weight:600; font-size:0.9rem">${escapeHtml(u.name)}</div>
+                <div style="font-size:0.75rem; color:var(--text-muted)">${u.role}</div>
+            </div>
+        </div>
+    `).join('');
 }
 
-async function loadMessages() {
-    try {
-        const [msgRes, onlineRes, typingRes] = await Promise.all([
-            fetch('/messages'),
-            fetch('/online-users'),
-            fetch('/typing', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ browser_id: browserId, is_typing: false }) })
-        ]);
-        
-        const messages = await msgRes.json();
-        const onlineUsers = await onlineRes.json();
-        const typingData = await typingRes.json();
-        
-        const chatDiv = document.getElementById('chat');
-        let html = '';
-        
-        messages.forEach(msg => {
-            const isSent = currentRole && msg.content.includes(`[${currentRole}]`);
-            const type = msg.content.includes('joined') ? 'system' : 'chat';
-            
-            html += `<div class="message-group ${isSent ? 'sent' : type === 'system' ? 'system' : 'received'}">
-                <div class="message-bubble">${msg.content.replace(/\[.\]/, '').trim()}</div>
-            </div>`;
-        });
-        
-        if (typingData.typing.length > 0) {
-            html += `<div class="typing-indicator"><span style="color:var(--text-secondary);">${typingData.typing.join(', ')} typing</span><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div>`;
-        }
-        
-        chatDiv.innerHTML = html;
-        chatDiv.scrollTop = chatDiv.scrollHeight;
-        
-        document.getElementById('usersList').innerHTML = onlineUsers.map(u => 
-            `<div class="user-item"><div class="user-item-name">${u.name}</div><div class="user-item-role">Role: ${u.role}</div></div>`
-        ).join('');
-        
-    } catch (e) { console.error("Error:", e); }
-}
-
-async function sendMsg() {
-    const input = document.getElementById('msg');
-    const text = input.value.trim();
-    if (!text || !currentRole) return;
-    input.value = '';
-    await sendMessage(text);
-    await loadMessages();
-}
-
-function handleEnter(event) {
-    if (event.key === 'Enter' && !event.shiftKey) {
-        event.preventDefault();
-        sendMsg();
+async function fetchTypingStatus() {
+    const res = await fetch('/typing', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({browser_id: browserId, is_typing: false}) // Just query
+    });
+    const data = await res.json();
+    const bar = document.getElementById('typingBar');
+    if (data.typing_names.length > 0) {
+        bar.textContent = `${data.typing_names.join(', ')} is typing...`;
+    } else {
+        bar.textContent = '';
     }
 }
 
-setInterval(loadMessages, 1000);
-loadMessages();
 </script>
 </body>
 </html>
