@@ -1,563 +1,503 @@
-from flask import Flask, request, jsonify
-from datetime import datetime
-from collections import defaultdict
+from flask import Flask, request, render_template_string
+from flask_socketio import SocketIO, emit, join_room, leave_room
 import time
+from datetime import datetime
+import uuid
 
+# --- CONFIGURATION ---
 app = Flask(__name__)
+app.config['SECRET_KEY'] = 'secret!'
 
-# --- In-Memory Storage ---
-BOT_HISTORY = []  # List of dicts: {'id': int, 'sender': str, 'role': str, 'text': str, 'time': str, 'type': str}
-USER_SESSIONS = {}  # browser_id -> {'name': str, 'role': str, 'last_seen': float}
-TYPING_STATUS = {}  # browser_id -> timestamp
+# Async mode 'eventlet' is best for performance, 'threading' is fine for local testing
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+
+# --- IN-MEMORY STORAGE ---
+# structure: { session_id: { 'username': str, 'room': str, 'id': str } }
+USERS = {}
+HISTORY = []
 
 @app.route("/")
-def home():
-    return "API is alive. Go to <a href='/whatsapp'>/whatsapp</a> to chat."
+def index():
+    return render_template_string(frontend_code)
 
-@app.route("/messages")
-def get_messages():
-    # client sends the ID of the last message they already have
-    last_id = int(request.args.get('last_id', -1))
-    
-    # Return only messages newer than last_id
-    new_messages = [msg for msg in BOT_HISTORY if msg['id'] > last_id]
-    
-    return jsonify(new_messages)
+# --- SOCKET.IO EVENTS (The Real-Time Protocol) ---
 
-@app.route("/send", methods=["POST"])
-def send_message():
-    data = request.json
-    message = data.get("message", "").strip()
-    browser_id = data.get("browser_id")
-    username = data.get("username", "").strip()
+@socketio.on('connect')
+def handle_connect():
+    print(f"Client connected: {request.sid}")
 
-    if not message:
-        return jsonify(status="empty")
-
-    # Update session activity
-    if browser_id in USER_SESSIONS:
-        USER_SESSIONS[browser_id]['last_seen'] = time.time()
-
-    # --- Registration Logic ---
-    if message.lower().startswith("register "):
-        parts = message.lower().split(" ", 1)
-        if len(parts) == 2:
-            role = parts[1].upper()
-            if role in ["A", "B"]:
-                USER_SESSIONS[browser_id] = {
-                    'name': username or f"User {role}", 
-                    'role': role,
-                    'last_seen': time.time()
-                }
-                
-                new_msg = {
-                    'id': len(BOT_HISTORY),
-                    'sender': "System",
-                    'role': 'SYSTEM',
-                    'text': f"👤 {USER_SESSIONS[browser_id]['name']} joined as {role}",
-                    'time': datetime.now().isoformat(),
-                    'type': 'system'
-                }
-                BOT_HISTORY.append(new_msg)
-                return jsonify(status="ok")
-
-    # --- Chat Logic ---
-    if browser_id in USER_SESSIONS:
-        user = USER_SESSIONS[browser_id]
-        new_msg = {
-            'id': len(BOT_HISTORY),
-            'sender': user['name'],
-            'role': user['role'],
-            'text': message,
-            'time': datetime.now().isoformat(),
-            'type': 'chat'
+@socketio.on('disconnect')
+def handle_disconnect():
+    user = USERS.get(request.sid)
+    if user:
+        # Notify others that user left (for Voice and Chat)
+        username = user['username']
+        emit('user_left', {'sid': request.sid, 'username': username}, broadcast=True)
+        
+        # Add system message
+        sys_msg = {
+            'type': 'system',
+            'text': f"❌ {username} disconnected",
+            'time': datetime.now().strftime("%H:%M")
         }
-        BOT_HISTORY.append(new_msg)
-        return jsonify(status="ok")
-    else:
-        return jsonify(status="error", message="Please register first")
+        emit('message', sys_msg, broadcast=True)
+        del USERS[request.sid]
 
-@app.route("/typing", methods=["POST"])
-def typing_endpoint():
-    data = request.json
-    browser_id = data.get("browser_id")
-    is_typing = data.get("is_typing", False)
+@socketio.on('register')
+def handle_register(data):
+    username = data.get('username')
+    # Store user session
+    USERS[request.sid] = {
+        'username': username,
+        'id': request.sid,
+        'mute': False
+    }
     
-    if is_typing:
-        TYPING_STATUS[browser_id] = time.time()
-    else:
-        TYPING_STATUS.pop(browser_id, None)
+    # Send history to new user
+    emit('history', HISTORY)
     
-    # Clean up old typing statuses (> 3 seconds)
-    current_time = time.time()
-    active_typing = []
+    # Broadcast join to others
+    emit('user_joined', {'sid': request.sid, 'username': username}, broadcast=True)
     
-    for bid, timestamp in list(TYPING_STATUS.items()):
-        if current_time - timestamp > 3:
-            del TYPING_STATUS[bid]
-        else:
-            name = USER_SESSIONS.get(bid, {}).get('name', 'Unknown')
-            active_typing.append(name)
-            
-    return jsonify(typing_names=active_typing)
+    # System message
+    sys_msg = {
+        'type': 'system',
+        'text': f"👋 {username} landed in the server",
+        'time': datetime.now().strftime("%H:%M")
+    }
+    HISTORY.append(sys_msg)
+    emit('message', sys_msg, broadcast=True)
+    
+    # Send updated user list
+    update_user_list()
 
-@app.route("/online-users")
-def get_online_users():
-    # Remove users inactive for > 60 seconds
-    current_time = time.time()
-    active_users = []
-    
-    for bid, data in list(USER_SESSIONS.items()):
-        if current_time - data['last_seen'] < 60:
-            active_users.append(data)
-        # We don't delete them from session, just don't show as 'online'
-            
-    return jsonify(active_users)
+@socketio.on('chat_message')
+def handle_message(data):
+    user = USERS.get(request.sid)
+    if user:
+        msg = {
+            'type': 'chat',
+            'sender': user['username'],
+            'text': data['msg'],
+            'sid': request.sid, # used for styling self vs others
+            'time': datetime.now().strftime("%H:%M")
+        }
+        HISTORY.append(msg)
+        # Keep history limited to 50 messages to save memory
+        if len(HISTORY) > 50:
+            HISTORY.pop(0)
+        emit('message', msg, broadcast=True)
 
-@app.route("/whatsapp")
-def whatsapp_ui():
-    return """
+# --- WEBRTC SIGNALING (The Voice Protocol) ---
+# WebRTC requires a "Signal Channel" to exchange connection info.
+# We use Socket.IO as that channel.
+
+@socketio.on('voice_signal')
+def handle_voice_signal(data):
+    """
+    Relays WebRTC signals (Offers, Answers, ICE Candidates) 
+    between peers.
+    target_sid: The specific user we want to connect to.
+    """
+    target_sid = data.get('target')
+    if target_sid in USERS:
+        # Forward the data to the specific target, tagging who sent it
+        emit('voice_signal', {
+            'sender_sid': request.sid,
+            'type': data['type'],
+            'payload': data['payload']
+        }, room=target_sid)
+
+def update_user_list():
+    # Convert dict to list for frontend
+    user_list = [{'sid': k, 'username': v['username']} for k, v in USERS.items()]
+    emit('update_users', user_list, broadcast=True)
+
+# --- FRONTEND CODE (Embedded for single-file convenience) ---
+frontend_code = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Pro Chat</title>
-<style>
-/* --- MODERN DARK THEME CSS --- */
-:root {
-    --bg-app: #0f172a;
-    --bg-panel: #1e293b;
-    --border: #334155;
-    --primary: #3b82f6;
-    --primary-hover: #2563eb;
-    --text-main: #f1f5f9;
-    --text-muted: #94a3b8;
-    --bubble-sent: #3b82f6;
-    --bubble-received: #334155;
-    --green: #22c55e;
-}
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Discord Clone (WebRTC)</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
+    <style>
+        :root {
+            --bg-tertiary: #202225;
+            --bg-secondary: #2f3136;
+            --bg-primary: #36393f;
+            --text-normal: #dcddde;
+            --text-muted: #72767d;
+            --header-primary: #fff;
+            --interactive-normal: #b9bbbe;
+            --interactive-hover: #dcddde;
+            --brand-experiment: #5865f2;
+            --brand-hover: #4752c4;
+            --green: #3ba55c;
+            --red: #ed4245;
+        }
+        
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'gg sans', 'Segoe UI', Tahoma, sans-serif; background: var(--bg-primary); color: var(--text-normal); height: 100vh; display: flex; overflow: hidden; }
 
-* { margin: 0; padding: 0; box-sizing: border-box; }
+        /* Sidebar (Users + Voice) */
+        .sidebar { width: 240px; background: var(--bg-secondary); display: flex; flex-direction: column; }
+        
+        .voice-panel {
+            background: var(--bg-tertiary);
+            padding: 10px;
+            border-bottom: 1px solid #202225;
+        }
+        
+        .voice-status {
+            display: flex; align-items: center; justify-content: space-between;
+            margin-bottom: 10px;
+        }
+        
+        .connection-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); margin-right: 8px; }
+        .connection-dot.connected { background: var(--green); box-shadow: 0 0 8px var(--green); }
+        
+        .controls { display: flex; gap: 5px; }
+        .btn-icon {
+            background: transparent; border: none; color: var(--interactive-normal); cursor: pointer; padding: 5px; border-radius: 4px;
+        }
+        .btn-icon:hover { background: rgba(255,255,255,0.1); }
+        .btn-icon.active { color: var(--red); }
 
-body {
-    font-family: 'Segoe UI', system-ui, sans-serif;
-    background-color: var(--bg-app);
-    color: var(--text-main);
-    height: 100vh;
-    display: flex;
-    overflow: hidden;
-}
+        .user-list-container { flex: 1; padding: 10px; overflow-y: auto; }
+        .user-list-header { font-size: 12px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; margin-bottom: 10px; }
+        
+        .user-item { display: flex; align-items: center; padding: 8px; border-radius: 4px; margin-bottom: 2px; cursor: pointer; }
+        .user-item:hover { background: rgba(79, 84, 92, 0.32); }
+        .avatar { width: 32px; height: 32px; border-radius: 50%; background: var(--brand-experiment); display: flex; align-items: center; justify-content: center; margin-right: 10px; font-weight: bold; color: white; position: relative; }
+        
+        /* Speaking Indicator */
+        .speaking-ring {
+            position: absolute; top: -2px; left: -2px; right: -2px; bottom: -2px;
+            border-radius: 50%; border: 2px solid var(--green);
+            opacity: 0; transition: opacity 0.1s;
+        }
 
-/* Sidebar */
-.sidebar {
-    width: 300px;
-    background: var(--bg-panel);
-    border-right: 1px solid var(--border);
-    display: flex;
-    flex-direction: column;
-    transition: transform 0.3s ease;
-}
+        /* Main Chat */
+        .main { flex: 1; display: flex; flex-direction: column; background: var(--bg-primary); }
+        .chat-header { height: 48px; border-bottom: 1px solid #26272d; display: flex; align-items: center; padding: 0 16px; box-shadow: 0 1px 0 rgba(4,4,5,0.02); }
+        .chat-area { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 15px; }
+        
+        /* Messages */
+        .message { display: flex; gap: 16px; margin-top: 5px; animation: fadeIn 0.2s; }
+        .message:hover { background: rgba(4,4,5,0.07); }
+        .msg-content { display: flex; flex-direction: column; }
+        .msg-header { display: flex; align-items: baseline; gap: 8px; }
+        .username { font-weight: 500; color: var(--header-primary); cursor: pointer; }
+        .username:hover { text-decoration: underline; }
+        .timestamp { font-size: 0.75rem; color: var(--text-muted); }
+        .text { color: var(--text-normal); font-size: 1rem; line-height: 1.375rem; white-space: pre-wrap; word-wrap: break-word; }
+        
+        .system-msg { color: var(--text-muted); font-size: 0.9rem; text-align: center; margin: 10px 0; font-style: italic; display: flex; align-items: center; justify-content: center; gap: 10px; }
+        .system-msg::before, .system-msg::after { content: ""; height: 1px; background: #4f545c; flex: 1; opacity: 0.3; }
 
-.header {
-    padding: 20px;
-    border-bottom: 1px solid var(--border);
-    font-weight: 600;
-    font-size: 1.1rem;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-}
+        /* Input */
+        .input-area { padding: 0 16px 24px; }
+        .input-wrapper { background: #40444b; border-radius: 8px; padding: 11px; display: flex; }
+        .msg-input { background: transparent; border: none; color: var(--text-normal); width: 100%; outline: none; font-size: 1rem; }
 
-.user-list {
-    flex: 1;
-    overflow-y: auto;
-    padding: 10px;
-}
+        /* Modal */
+        .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.8); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+        .modal { background: var(--bg-primary); padding: 30px; border-radius: 5px; width: 400px; text-align: center; box-shadow: 0 0 15px rgba(0,0,0,0.5); }
+        .modal input { width: 100%; padding: 10px; background: var(--bg-tertiary); border: 1px solid #202225; color: white; border-radius: 3px; margin-bottom: 20px; outline: none; }
+        .btn-join { background: var(--brand-experiment); color: white; padding: 10px 20px; border: none; border-radius: 3px; cursor: pointer; width: 100%; font-weight: 600; }
+        .btn-join:hover { background: var(--brand-hover); }
 
-.user-card {
-    padding: 10px;
-    margin-bottom: 5px;
-    border-radius: 8px;
-    background: rgba(255,255,255,0.03);
-    display: flex;
-    align-items: center;
-    gap: 10px;
-}
-
-.status-dot {
-    width: 8px;
-    height: 8px;
-    background: var(--green);
-    border-radius: 50%;
-    box-shadow: 0 0 5px var(--green);
-}
-
-/* Main Chat */
-.chat-container {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    background-image: radial-gradient(var(--border) 1px, transparent 1px);
-    background-size: 20px 20px;
-}
-
-.chat-messages {
-    flex: 1;
-    overflow-y: auto;
-    padding: 20px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    scroll-behavior: smooth;
-}
-
-/* Scrollbar Styling */
-::-webkit-scrollbar { width: 6px; }
-::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-
-/* Message Bubbles */
-.msg-row {
-    display: flex;
-    width: 100%;
-    opacity: 0;
-    animation: fadeIn 0.3s forwards;
-}
-
-@keyframes fadeIn { to { opacity: 1; transform: translateY(0); } }
-
-.msg-row.sent { justify-content: flex-end; }
-.msg-row.received { justify-content: flex-start; }
-.msg-row.system { justify-content: center; margin: 10px 0; }
-
-.bubble {
-    max-width: 60%;
-    padding: 10px 14px;
-    border-radius: 12px;
-    position: relative;
-    font-size: 0.95rem;
-    line-height: 1.4;
-    box-shadow: 0 2px 5px rgba(0,0,0,0.2);
-}
-
-.msg-row.sent .bubble {
-    background: var(--bubble-sent);
-    color: white;
-    border-bottom-right-radius: 2px;
-}
-
-.msg-row.received .bubble {
-    background: var(--bubble-received);
-    color: var(--text-main);
-    border-bottom-left-radius: 2px;
-}
-
-.msg-row.system .bubble {
-    background: rgba(0,0,0,0.3);
-    color: var(--text-muted);
-    font-size: 0.8rem;
-    border-radius: 20px;
-    padding: 4px 12px;
-}
-
-.sender-name {
-    font-size: 0.75rem;
-    font-weight: 700;
-    margin-bottom: 4px;
-    color: rgba(255,255,255,0.7);
-}
-
-.timestamp {
-    font-size: 0.7rem;
-    opacity: 0.7;
-    text-align: right;
-    margin-top: 4px;
-}
-
-/* Typing Indicator */
-.typing-bar {
-    padding: 5px 20px;
-    height: 24px;
-    font-size: 0.8rem;
-    color: var(--text-muted);
-    font-style: italic;
-}
-
-/* Input Area */
-.input-area {
-    padding: 20px;
-    background: var(--bg-panel);
-    display: flex;
-    gap: 10px;
-    border-top: 1px solid var(--border);
-}
-
-input {
-    flex: 1;
-    background: var(--bg-app);
-    border: 1px solid var(--border);
-    padding: 12px;
-    border-radius: 24px;
-    color: white;
-    outline: none;
-    font-size: 1rem;
-}
-
-input:focus { border-color: var(--primary); }
-
-button {
-    background: var(--primary);
-    color: white;
-    border: none;
-    padding: 0 20px;
-    border-radius: 24px;
-    cursor: pointer;
-    font-weight: 600;
-    transition: background 0.2s;
-}
-
-button:hover { background: var(--primary-hover); }
-
-/* Registration Modal */
-.modal-overlay {
-    position: fixed;
-    top: 0; left: 0; width: 100%; height: 100%;
-    background: rgba(0,0,0,0.8);
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    z-index: 1000;
-}
-
-.modal {
-    background: var(--bg-panel);
-    padding: 30px;
-    border-radius: 16px;
-    width: 90%;
-    max-width: 400px;
-    border: 1px solid var(--border);
-    text-align: center;
-}
-
-.modal input { width: 100%; margin: 15px 0; }
-.btn-group { display: flex; gap: 10px; justify-content: center; }
-
-</style>
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
 </head>
 <body>
 
 <div class="modal-overlay" id="loginModal">
     <div class="modal">
-        <h2>Welcome</h2>
-        <p style="color:var(--text-muted); margin-top:5px;">Enter your name to join</p>
-        <input type="text" id="usernameInput" placeholder="Your Display Name">
-        <div class="btn-group">
-            <button onclick="register('A')">Join as A</button>
-            <button onclick="register('B')" style="background:#475569">Join as B</button>
-        </div>
+        <h2 style="color: white; margin-bottom: 20px;">Welcome to DisClone</h2>
+        <input type="text" id="username" placeholder="Enter a username">
+        <button class="btn-join" onclick="joinServer()">Join Server</button>
     </div>
 </div>
 
 <div class="sidebar">
-    <div class="header">
-        <span>👥</span> Online Users
-    </div>
-    <div class="user-list" id="userList">
+    <div class="voice-panel">
+        <div class="voice-status">
+            <div style="display:flex; align-items:center;">
+                <div class="connection-dot" id="voiceDot"></div>
+                <span style="font-size: 12px; font-weight: 700;">Voice Connected</span>
+            </div>
         </div>
-</div>
-
-<div class="chat-container">
-    <div class="header">
-        <span id="headerTitle">Chat Room</span>
+        <div class="controls">
+            <button class="btn-icon" id="micBtn" onclick="toggleMic()">🎤</button>
+            <button class="btn-icon" id="deafenBtn" onclick="toggleDeafen()">🎧</button>
+        </div>
     </div>
     
-    <div class="chat-messages" id="chatBox">
-        </div>
+    <div class="user-list-container">
+        <div class="user-list-header">Online Users</div>
+        <div id="userList"></div>
+    </div>
+</div>
 
-    <div class="typing-bar" id="typingBar"></div>
-
+<div class="main">
+    <div class="chat-header">
+        <span style="font-weight: bold; font-size: 16px;"># general</span>
+    </div>
+    <div class="chat-area" id="chatArea"></div>
     <div class="input-area">
-        <input type="text" id="msgInput" placeholder="Type a message..." autocomplete="off">
-        <button onclick="sendMessage()">Send</button>
+        <div class="input-wrapper">
+            <input type="text" class="msg-input" id="msgInput" placeholder="Message #general" autocomplete="off">
+        </div>
     </div>
 </div>
 
 <script>
-// --- CONFIGURATION ---
-const browserId = Math.random().toString(36).substring(2);
-let lastMessageId = -1;
-let myRole = null;
-let myName = null;
-let typingTimer = null;
-
-// --- REGISTRATION ---
-async function register(role) {
-    const nameInput = document.getElementById('usernameInput');
-    const name = nameInput.value.trim() || `User ${role}`;
+    const socket = io();
+    let myUsername = "";
+    let localStream;
+    let peers = {}; // Keep track of WebRTC connections: { sid: RTCPeerConnection }
+    let isMuted = false;
     
-    myName = name;
-    myRole = role;
+    // --- WEBRTC CONFIGURATION ---
+    const rtcConfig = {
+        iceServers: [
+            { urls: "stun:stun.l.google.com:19302" } // Public STUN server to find IP
+        ]
+    };
 
-    await fetch('/send', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-            message: `register ${role}`,
-            browser_id: browserId,
-            username: name
-        })
-    });
-
-    document.getElementById('loginModal').style.display = 'none';
-    document.getElementById('headerTitle').innerText = `${name} (${role})`;
-    document.getElementById('msgInput').focus();
-    
-    startPolling();
-}
-
-// --- CORE CHAT LOGIC ---
-async function startPolling() {
-    setInterval(fetchMessages, 1000);     // Fetch new messages
-    setInterval(fetchOnlineUsers, 3000); // Fetch online users
-    setInterval(fetchTypingStatus, 1500); // Fetch typing status
-}
-
-async function fetchMessages() {
-    try {
-        // Only ask for messages NEWER than the last one we saw
-        const response = await fetch(`/messages?last_id=${lastMessageId}`);
-        const messages = await response.json();
-
-        if (messages.length === 0) return;
-
-        const chatBox = document.getElementById('chatBox');
+    // --- JOIN LOGIC ---
+    async function joinServer() {
+        const input = document.getElementById('username');
+        if(!input.value) return;
+        myUsername = input.value;
         
-        // Smart scroll detection: are we at the bottom?
-        const isAtBottom = (chatBox.scrollHeight - chatBox.scrollTop) <= (chatBox.clientHeight + 100);
-
-        messages.forEach(msg => {
-            appendMessageToDOM(msg);
-            lastMessageId = msg.id; // Update our tracker
-        });
-
-        if (isAtBottom) {
-            chatBox.scrollTop = chatBox.scrollHeight;
+        document.getElementById('loginModal').style.display = 'none';
+        
+        // 1. Get Microphone Access immediately
+        try {
+            localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+            // By default, join muted to avoid feedback loops in testing
+            localStream.getAudioTracks()[0].enabled = true; 
+            document.getElementById('voiceDot').classList.add('connected');
+        } catch (e) {
+            console.error("Mic access denied", e);
+            alert("Microphone access is required for voice chat!");
         }
-    } catch (e) { console.error("Poll error", e); }
-}
 
-function appendMessageToDOM(msg) {
-    const chatBox = document.getElementById('chatBox');
-    const div = document.createElement('div');
-    
-    // Determine class
-    let rowClass = 'msg-row';
-    if (msg.type === 'system') rowClass += ' system';
-    else if (msg.role === myRole) rowClass += ' sent';
-    else rowClass += ' received';
-    
-    div.className = rowClass;
-
-    const timeStr = new Date(msg.time).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-
-    if (msg.type === 'system') {
-        div.innerHTML = `<div class="bubble">${escapeHtml(msg.text)}</div>`;
-    } else {
-        div.innerHTML = `
-            <div class="bubble">
-                <div class="sender-name">${escapeHtml(msg.sender)}</div>
-                ${escapeHtml(msg.text)}
-                <div class="timestamp">${timeStr}</div>
-            </div>
-        `;
+        // 2. Register with Socket Server
+        socket.emit('register', { username: myUsername });
     }
 
-    chatBox.appendChild(div);
-}
+    // --- SOCKET.IO HANDLERS ---
+    
+    // 1. Chat & User Management
+    socket.on('message', (msg) => {
+        appendMessage(msg);
+    });
 
-async function sendMessage() {
+    socket.on('history', (history) => {
+        history.forEach(appendMessage);
+        scrollToBottom();
+    });
+
+    socket.on('update_users', (users) => {
+        const list = document.getElementById('userList');
+        list.innerHTML = users.map(u => `
+            <div class="user-item">
+                <div class="avatar">
+                    ${u.username[0].toUpperCase()}
+                    <div class="speaking-ring" id="ring-${u.sid}"></div>
+                </div>
+                <div style="font-weight: 500; font-size: 14px;">${u.username} ${u.username === myUsername ? '(You)' : ''}</div>
+            </div>
+        `).join('');
+    });
+
+    // --- WEBRTC LOGIC (The Advanced Part) ---
+
+    // A. New User Joined -> We initiate the call (Mesh Network)
+    socket.on('user_joined', async (data) => {
+        if(data.username === myUsername) return; // Don't call myself
+        console.log("New user joined, initiating call to:", data.username);
+        createPeerConnection(data.sid, true); // true = I am the initiator
+    });
+
+    // B. User Left -> Cleanup
+    socket.on('user_left', (data) => {
+        if(peers[data.sid]) {
+            peers[data.sid].close();
+            delete peers[data.sid];
+            // Remove audio element
+            const audio = document.getElementById(`audio-${data.sid}`);
+            if(audio) audio.remove();
+        }
+    });
+
+    // C. Handle Signals (Offer, Answer, ICE)
+    socket.on('voice_signal', async (data) => {
+        const senderSid = data.sender_sid;
+        const type = data.type;
+        const payload = data.payload;
+
+        if (!peers[senderSid]) {
+            // If I receive an offer but don't have a peer yet, create one (non-initiator)
+            createPeerConnection(senderSid, false);
+        }
+
+        const pc = peers[senderSid];
+
+        try {
+            if (type === 'offer') {
+                await pc.setRemoteDescription(new RTCSessionDescription(payload));
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                socket.emit('voice_signal', { target: senderSid, type: 'answer', payload: answer });
+            } else if (type === 'answer') {
+                await pc.setRemoteDescription(new RTCSessionDescription(payload));
+            } else if (type === 'ice-candidate') {
+                if(payload) {
+                    await pc.addIceCandidate(new RTCIceCandidate(payload));
+                }
+            }
+        } catch (e) {
+            console.error("Signal Error", e);
+        }
+    });
+
+    function createPeerConnection(targetSid, isInitiator) {
+        const pc = new RTCPeerConnection(rtcConfig);
+        peers[targetSid] = pc;
+
+        // Add my local audio stream to the connection
+        if (localStream) {
+            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+        }
+
+        // Handle ICE Candidates (Networking)
+        pc.onicecandidate = (event) => {
+            if (event.candidate) {
+                socket.emit('voice_signal', { target: targetSid, type: 'ice-candidate', payload: event.candidate });
+            }
+        };
+
+        // Handle Incoming Stream (When the other person speaks)
+        pc.ontrack = (event) => {
+            console.log("Received remote stream from", targetSid);
+            let audio = document.getElementById(`audio-${targetSid}`);
+            if (!audio) {
+                audio = document.createElement('audio');
+                audio.id = `audio-${targetSid}`;
+                audio.autoplay = true;
+                document.body.appendChild(audio);
+            }
+            audio.srcObject = event.streams[0];
+            
+            // Visualizer for speaking (Simple volume detection)
+            monitorAudioLevel(event.streams[0], targetSid);
+        };
+
+        // If I am the initiator, I create the offer
+        if (isInitiator) {
+            pc.onnegotiationneeded = async () => {
+                try {
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                    socket.emit('voice_signal', { target: targetSid, type: 'offer', payload: offer });
+                } catch (e) { console.error(e); }
+            };
+        }
+    }
+
+    // --- UI HELPERS ---
+
+    function monitorAudioLevel(stream, sid) {
+        // Simple AudioContext to detect volume for the green ring
+        const audioContext = new AudioContext();
+        const mediaStreamSource = audioContext.createMediaStreamSource(stream);
+        const scriptProcessor = audioContext.createScriptProcessor(2048, 1, 1);
+        
+        mediaStreamSource.connect(scriptProcessor);
+        scriptProcessor.connect(audioContext.destination);
+
+        scriptProcessor.onaudioprocess = function(event) {
+            const inputBuffer = event.inputBuffer;
+            const inputData = inputBuffer.getChannelData(0);
+            let sum = 0;
+            for (let i = 0; i < inputData.length; i++) { sum += inputData[i] * inputData[i]; }
+            let rms = Math.sqrt(sum / inputData.length);
+            
+            const ring = document.getElementById(`ring-${sid}`);
+            if(ring) {
+                ring.style.opacity = rms > 0.02 ? 1 : 0;
+            }
+        };
+    }
+
+    function appendMessage(msg) {
+        const chatArea = document.getElementById('chatArea');
+        const div = document.createElement('div');
+        
+        if (msg.type === 'system') {
+            div.className = 'system-msg';
+            div.innerHTML = `${msg.text} <span style="font-size:0.7em">${msg.time}</span>`;
+        } else {
+            div.className = 'message';
+            div.innerHTML = `
+                <div class="avatar">${msg.sender[0].toUpperCase()}</div>
+                <div class="msg-content">
+                    <div class="msg-header">
+                        <span class="username">${msg.sender}</span>
+                        <span class="timestamp">${msg.time}</span>
+                    </div>
+                    <div class="text">${formatText(msg.text)}</div>
+                </div>
+            `;
+        }
+        chatArea.appendChild(div);
+        scrollToBottom();
+    }
+    
+    function formatText(text) {
+        // Simple Link and Markdown formatting
+        return text
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/https?:\/\/\S+/g, '<a href="$&" target="_blank" style="color:#00b0f4">$&</a>');
+    }
+
+    function scrollToBottom() {
+        const chatArea = document.getElementById('chatArea');
+        chatArea.scrollTop = chatArea.scrollHeight;
+    }
+
+    // Input Handling
     const input = document.getElementById('msgInput');
-    const text = input.value.trim();
-    if (!text) return;
-
-    input.value = '';
-    
-    // Optimistic UI: You could append immediately here, but for now we wait for polling
-    await fetch('/send', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-            message: text,
-            browser_id: browserId,
-            username: myName
-        })
+    input.addEventListener('keydown', (e) => {
+        if(e.key === 'Enter') {
+            const txt = input.value.trim();
+            if(txt) {
+                socket.emit('chat_message', { msg: txt });
+                input.value = '';
+            }
+        }
     });
     
-    // Trigger immediate fetch
-    fetchMessages();
-}
-
-// --- UTILITIES ---
-function escapeHtml(text) {
-    if (!text) return "";
-    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
-}
-
-// --- TYPING & USERS ---
-const msgInput = document.getElementById('msgInput');
-msgInput.addEventListener('input', () => {
-    clearTimeout(typingTimer);
-    fetch('/typing', {
-        method: 'POST', 
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({browser_id: browserId, is_typing: true})
-    });
-    
-    typingTimer = setTimeout(() => {
-        fetch('/typing', {
-            method: 'POST', 
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({browser_id: browserId, is_typing: false})
-        });
-    }, 2000);
-});
-
-msgInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        sendMessage();
+    function toggleMic() {
+        const track = localStream.getAudioTracks()[0];
+        track.enabled = !track.enabled;
+        document.getElementById('micBtn').classList.toggle('active');
+        document.getElementById('micBtn').textContent = track.enabled ? '🎤' : '🔇';
     }
-});
 
-async function fetchOnlineUsers() {
-    const res = await fetch('/online-users');
-    const users = await res.json();
-    const list = document.getElementById('userList');
-    list.innerHTML = users.map(u => `
-        <div class="user-card">
-            <div class="status-dot"></div>
-            <div>
-                <div style="font-weight:600; font-size:0.9rem">${escapeHtml(u.name)}</div>
-                <div style="font-size:0.75rem; color:var(--text-muted)">${u.role}</div>
-            </div>
-        </div>
-    `).join('');
-}
-
-async function fetchTypingStatus() {
-    const res = await fetch('/typing', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({browser_id: browserId, is_typing: false}) // Just query
-    });
-    const data = await res.json();
-    const bar = document.getElementById('typingBar');
-    if (data.typing_names.length > 0) {
-        bar.textContent = `${data.typing_names.join(', ')} is typing...`;
-    } else {
-        bar.textContent = '';
+    function toggleDeafen() {
+        // Mute all remote audio elements
+        isMuted = !isMuted;
+        document.querySelectorAll('audio').forEach(a => a.muted = isMuted);
+        document.getElementById('deafenBtn').classList.toggle('active');
     }
-}
 
 </script>
 </body>
@@ -565,4 +505,9 @@ async function fetchTypingStatus() {
 """
 
 if __name__ == "__main__":
-    app.run(port=5000, debug=True)
+    # HOST='0.0.0.0' allows other computers on your wifi to connect
+    print("--- Starting Discord Clone Server ---")
+    print("1. Ensure you installed: pip install flask flask-socketio eventlet")
+    print("2. Open http://localhost:5000 in multiple tabs")
+    print("3. For Voice to work between different devices, you need HTTPS or localhost.")
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
